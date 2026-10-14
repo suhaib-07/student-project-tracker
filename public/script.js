@@ -23,6 +23,14 @@ cancelButton.hidden = true;
 cancelButton.style.marginLeft = '8px';
 submitButton.insertAdjacentElement('afterend', cancelButton);
 
+// Create a retry button for failed project-list loads.
+const retryButton = document.createElement('button');
+retryButton.type = 'button';
+retryButton.textContent = 'Retry loading projects';
+retryButton.hidden = true;
+retryButton.style.marginLeft = '8px';
+message.insertAdjacentElement('afterend', retryButton);
+
 // Translate between the existing HTML option and API status.
 function toApiStatus(status) {
   return status === 'Not Started' ? 'Planned' : status;
@@ -37,16 +45,19 @@ function showMessage(text) {
 }
 
 function updateControls() {
-  const disabled = isLoading || isSaving || loadFailed;
-  submitButton.disabled = disabled;
-  nameInput.disabled = disabled;
-  statusInput.disabled = disabled;
+  const mutationDisabled = isLoading || isSaving || loadFailed;
+
+  submitButton.disabled = mutationDisabled;
+  nameInput.disabled = mutationDisabled;
+  statusInput.disabled = mutationDisabled;
 
   projectList.querySelectorAll('button').forEach((button) => {
-    button.disabled = isLoading || isSaving || loadFailed;
+    button.disabled = mutationDisabled;
   });
 
   cancelButton.disabled = isLoading || isSaving;
+  retryButton.disabled = isLoading || isSaving;
+  retryButton.hidden = !loadFailed;
 }
 
 function resetForm() {
@@ -60,10 +71,18 @@ function resetForm() {
 function renderProjects() {
   projectList.replaceChildren();
 
-  if (projects.length === 0 && !isLoading && !loadFailed) {
-    const emptyItem = document.createElement('li');
-    emptyItem.textContent = 'No projects yet. Add your first project above.';
-    projectList.appendChild(emptyItem);
+  if (isLoading) {
+    const item = document.createElement('li');
+    item.textContent = 'Loading projects...';
+    projectList.appendChild(item);
+  } else if (loadFailed) {
+    const item = document.createElement('li');
+    item.textContent = 'Projects could not be displayed because loading failed.';
+    projectList.appendChild(item);
+  } else if (projects.length === 0) {
+    const item = document.createElement('li');
+    item.textContent = 'No projects yet. Add your first project above.';
+    projectList.appendChild(item);
   }
 
   for (const project of projects) {
@@ -73,8 +92,7 @@ function renderProjects() {
     projectName.textContent = project.name;
 
     const projectStatus = document.createElement('span');
-    projectStatus.textContent =
-      ` — ${toFormStatus(project.status)}`;
+    projectStatus.textContent = ` — ${toFormStatus(project.status)}`;
 
     const editButton = document.createElement('button');
     editButton.type = 'button';
@@ -107,7 +125,7 @@ function renderProjects() {
       );
 
       // Cancelling does not send a request or change anything.
-      if (!confirmed) return;
+      if (!confirmed || isLoading || isSaving || loadFailed) return;
 
       isSaving = true;
       updateControls();
@@ -127,6 +145,8 @@ function renderProjects() {
           resetForm();
         }
 
+        // The deletion succeeded. Refresh the collection before reporting
+        // the final result, while keeping mutation controls locked.
         await loadProjects('Project deleted successfully.');
       } catch (error) {
         showMessage(`Could not delete project: ${error.message}`);
@@ -153,6 +173,7 @@ function renderProjects() {
 async function getApiError(response) {
   try {
     const data = await response.json();
+
     if (typeof data.error === 'string' && data.error.trim()) {
       return data.error;
     }
@@ -164,10 +185,13 @@ async function getApiError(response) {
 }
 
 async function loadProjects(successMessage = '') {
+  if (isLoading) return false;
+
   isLoading = true;
   loadFailed = false;
   showMessage('Loading projects...');
   updateControls();
+  renderProjects();
 
   try {
     const response = await fetch('/api/projects');
@@ -178,15 +202,22 @@ async function loadProjects(successMessage = '') {
 
     const data = await response.json();
 
-    if (!Array.isArray(data)) {
+    if (
+      !Array.isArray(data) ||
+      !data.every((project) =>
+        project &&
+        Number.isSafeInteger(project.id) &&
+        project.id > 0 &&
+        typeof project.name === 'string' &&
+        typeof project.status === 'string'
+      )
+    ) {
       throw new Error('The server returned an unexpected project list.');
     }
 
     projects = data;
     loadFailed = false;
 
-    // If a refresh shows that the edited project no longer exists,
-    // exit Edit mode rather than editing a stale record.
     if (
       editingId !== null &&
       !projects.some((project) => project.id === editingId)
@@ -201,11 +232,14 @@ async function loadProjects(successMessage = '') {
           : `Loaded ${projects.length} project(s).`)
       );
     }
+
+    return true;
   } catch (error) {
     loadFailed = true;
     showMessage(
-      `Could not load projects: ${error.message}. Check your connection and try refreshing the page.`
+      `Could not load projects: ${error.message}. Check your connection and retry.`
     );
+    return false;
   } finally {
     isLoading = false;
     updateControls();
@@ -217,7 +251,7 @@ form.addEventListener('submit', async (event) => {
   event.preventDefault();
 
   if (isLoading || isSaving || loadFailed) {
-    showMessage('Projects are not ready. Reload the project list first.');
+    showMessage('Projects are not ready. Retry loading the project list first.');
     return;
   }
 
@@ -243,8 +277,9 @@ form.addEventListener('submit', async (event) => {
   }
 
   const wasEditing = editingId !== null;
+  const originalEditingId = editingId;
   const url = wasEditing
-    ? `/api/projects/${encodeURIComponent(editingId)}`
+    ? `/api/projects/${encodeURIComponent(originalEditingId)}`
     : '/api/projects';
   const method = wasEditing ? 'PUT' : 'POST';
 
@@ -265,7 +300,6 @@ form.addEventListener('submit', async (event) => {
       throw new Error(await getApiError(response));
     }
 
-    // Read the server response so unexpected responses are reported.
     const savedProject = await response.json();
 
     if (
@@ -277,18 +311,25 @@ form.addEventListener('submit', async (event) => {
       throw new Error('The server returned an unexpected saved project.');
     }
 
-    // Only reset the form after a successful mutation response.
+    // Do not reset the form until the mutation itself succeeds.
     resetForm();
+
+    // Refresh from the API. loadProjects handles its own errors, so a
+    // refresh failure is reported as a load failure rather than a failed save.
     await loadProjects(
-      wasEditing ? 'Project updated successfully.' : 'Project added successfully.'
+      wasEditing
+        ? 'Project updated successfully.'
+        : 'Project added successfully.'
     );
   } catch (error) {
+    // Leave the entered values and editingId intact on a failed save.
     showMessage(
       `Could not ${wasEditing ? 'save changes' : 'add project'}: ${error.message}. Your form input has been kept.`
     );
   } finally {
     isSaving = false;
     updateControls();
+    renderProjects();
   }
 });
 
@@ -298,6 +339,11 @@ cancelButton.addEventListener('click', () => {
   resetForm();
   showMessage('Edit cancelled.');
   nameInput.focus();
+});
+
+retryButton.addEventListener('click', async () => {
+  if (isLoading || isSaving) return;
+  await loadProjects();
 });
 
 // Initial load: the API, not browser storage, supplies the projects.
